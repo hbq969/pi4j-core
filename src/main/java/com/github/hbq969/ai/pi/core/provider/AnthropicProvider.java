@@ -27,6 +27,7 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -36,6 +37,16 @@ public class AnthropicProvider {
 
     private static final MediaType JSON = MediaType.get("application/json; charset=utf-8");
     private static final Gson gson = new Gson();
+    private static final String PARAM_REQUEST_TIMEOUT = "request_timeout";
+    private static final String PARAM_MODEL = "model";
+    private static final String PARAM_MAX_TOKENS = "max_tokens";
+    private static final String PARAM_STREAM = "stream";
+    private static final String PARAM_SYSTEM = "system";
+    private static final String PARAM_MESSAGES = "messages";
+    private static final String PARAM_TOOLS = "tools";
+    private static final Set<String> RESERVED_REQUEST_PARAMS = Set.of(
+            PARAM_REQUEST_TIMEOUT, PARAM_MODEL, PARAM_MAX_TOKENS, PARAM_STREAM,
+            PARAM_SYSTEM, PARAM_MESSAGES, PARAM_TOOLS);
 
     /** Anthropic 要求 tool_call_id 只含 [a-zA-Z0-9_-] */
     private static String sanitizeToolCallId(String id) {
@@ -111,7 +122,7 @@ public class AnthropicProvider {
                 .post(RequestBody.create(gson.toJson(body), JSON))
                 .build();
 
-        Response response = client.newCall(request).execute();
+        Response response = clientFor(model).newCall(request).execute();
         if (!response.isSuccessful()) {
             String errBody = "";
             try { if (response.body() != null) errBody = response.body().string(); } catch (Exception ignored) {}
@@ -127,6 +138,7 @@ public class AnthropicProvider {
         body.addProperty("model", model.id());
         body.addProperty("max_tokens", model.maxTokens());
         body.addProperty("stream", true);
+        addConfiguredParams(body, model.params());
 
         // system prompt → 顶层字段
         ctx.systemPrompt().ifPresent(sp -> {
@@ -155,6 +167,41 @@ public class AnthropicProvider {
         }
 
         return body;
+    }
+
+    /** 将 Anthropic 专属参数（例如 thinking）透传到请求体。 */
+    private void addConfiguredParams(JsonObject body, String params) {
+        if (params == null || params.isBlank()) return;
+        try {
+            JsonObject configured = gson.fromJson(params, JsonObject.class);
+            if (configured == null) return;
+            configured.entrySet().stream()
+                    .filter(e -> !RESERVED_REQUEST_PARAMS.contains(e.getKey()))
+                    .forEach(e -> body.add(e.getKey(), e.getValue()));
+        } catch (Exception ignored) {
+            // 非法参数不阻断请求，沿用 Provider 默认请求体。
+        }
+    }
+
+    private OkHttpClient clientFor(Model model) {
+        int timeout = requestTimeout(model.params());
+        if (timeout <= 0 || timeout == config.getReadTimeoutSeconds()) return client;
+        return new OkHttpClient.Builder()
+                .connectTimeout(config.getConnectTimeoutSeconds(), TimeUnit.SECONDS)
+                .readTimeout(timeout, TimeUnit.SECONDS)
+                .writeTimeout(config.getWriteTimeoutSeconds(), TimeUnit.SECONDS)
+                .build();
+    }
+
+    private int requestTimeout(String params) {
+        if (params == null || params.isBlank()) return 0;
+        try {
+            JsonObject configured = gson.fromJson(params, JsonObject.class);
+            JsonElement timeout = configured != null ? configured.get(PARAM_REQUEST_TIMEOUT) : null;
+            return timeout != null && !timeout.isJsonNull() ? timeout.getAsInt() : 0;
+        } catch (Exception ignored) {
+            return 0;
+        }
     }
 
     /**

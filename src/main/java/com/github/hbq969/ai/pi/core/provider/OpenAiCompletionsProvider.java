@@ -27,6 +27,7 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -36,6 +37,23 @@ public class OpenAiCompletionsProvider {
 
     private static final MediaType JSON = MediaType.get("application/json; charset=utf-8");
     private static final Gson gson = new Gson();
+    private static final String PARAM_REQUEST_TIMEOUT = "request_timeout";
+    private static final String PARAM_MODEL = "model";
+    private static final String PARAM_STREAM = "stream";
+    private static final String PARAM_STREAM_OPTIONS = "stream_options";
+    private static final String PARAM_STORE = "store";
+    private static final String PARAM_MESSAGES = "messages";
+    private static final String PARAM_TOOLS = "tools";
+    private static final String PARAM_MAX_TOKENS = "max_tokens";
+    private static final String PARAM_MAX_COMPLETION_TOKENS = "max_completion_tokens";
+    private static final String PARAM_REASONING_CONTENT = "reasoning_content";
+    private static final String PARAM_THINKING = "thinking";
+    private static final String PARAM_CONTENT = "content";
+    private static final String PARAM_TEXT = "text";
+    private static final Set<String> RESERVED_REQUEST_PARAMS = Set.of(
+            PARAM_REQUEST_TIMEOUT, PARAM_MODEL, PARAM_STREAM, PARAM_STREAM_OPTIONS,
+            PARAM_STORE, PARAM_MESSAGES, PARAM_TOOLS, PARAM_MAX_TOKENS,
+            PARAM_MAX_COMPLETION_TOKENS);
 
     private final PiCoreConfig config;
     private final OkHttpClient client;
@@ -124,7 +142,7 @@ public class OpenAiCompletionsProvider {
         // 自定义 headers
         config.getHeaders().forEach(reqBuilder::header);
 
-        Response response = client.newCall(reqBuilder.build()).execute();
+        Response response = clientFor(model).newCall(reqBuilder.build()).execute();
         if (!response.isSuccessful()) {
             String errBody = "";
             try { if (response.body() != null) errBody = response.body().string(); } catch (Exception ignored) {}
@@ -146,6 +164,8 @@ public class OpenAiCompletionsProvider {
         if (model.maxTokens() > 0) {
             body.addProperty("max_completion_tokens", model.maxTokens());
         }
+
+        addConfiguredParams(body, model.params());
 
         // messages
         JsonArray messages = new JsonArray();
@@ -178,6 +198,44 @@ public class OpenAiCompletionsProvider {
         }
 
         return body;
+    }
+
+    /**
+     * 将模型配置中的 provider 参数透传给 OpenAI-compatible 接口。
+     * 请求结构和传输控制字段由 pi.core 统一维护，避免配置覆盖 messages/tools 等核心字段。
+     */
+    private void addConfiguredParams(JsonObject body, String params) {
+        if (params == null || params.isBlank()) return;
+        try {
+            JsonObject configured = gson.fromJson(params, JsonObject.class);
+            if (configured == null) return;
+            configured.entrySet().stream()
+                    .filter(e -> !RESERVED_REQUEST_PARAMS.contains(e.getKey()))
+                    .forEach(e -> body.add(e.getKey(), e.getValue()));
+        } catch (Exception ignored) {
+            // 非法参数不应阻断模型请求，沿用 pi.core 默认请求体。
+        }
+    }
+
+    private OkHttpClient clientFor(Model model) {
+        int timeout = requestTimeout(model.params());
+        if (timeout <= 0 || timeout == config.getReadTimeoutSeconds()) return client;
+        return new OkHttpClient.Builder()
+                .connectTimeout(config.getConnectTimeoutSeconds(), TimeUnit.SECONDS)
+                .readTimeout(timeout, TimeUnit.SECONDS)
+                .writeTimeout(config.getWriteTimeoutSeconds(), TimeUnit.SECONDS)
+                .build();
+    }
+
+    private int requestTimeout(String params) {
+        if (params == null || params.isBlank()) return 0;
+        try {
+            JsonObject configured = gson.fromJson(params, JsonObject.class);
+            JsonElement timeout = configured != null ? configured.get(PARAM_REQUEST_TIMEOUT) : null;
+            return timeout != null && !timeout.isJsonNull() ? timeout.getAsInt() : 0;
+        } catch (Exception ignored) {
+            return 0;
+        }
     }
 
     private JsonObject convertMessage(Message msg) {
@@ -225,11 +283,14 @@ public class OpenAiCompletionsProvider {
 
         var content = new ArrayList<>(partial.content());
         int textIdx = -1;
+        int thinkingIdx = -1;
         int toolIdx = -1;
         String toolName = "";
         String toolId = "";
         StringBuilder toolArgs = new StringBuilder();
         boolean textStarted = false;
+        boolean thinkingStarted = false;
+        boolean thinkingEnded = false;
         boolean toolStarted = false;
 
         try (var reader = new BufferedReader(new InputStreamReader(bodyStream.byteStream()))) {
@@ -273,9 +334,37 @@ public class OpenAiCompletionsProvider {
                             partial.usage(), mapStopReason(choice.get("finish_reason").getAsString()), null);
                 }
 
+                // DeepSeek/OpenAI-compatible thinking 增量通常使用 reasoning_content，部分实现使用 thinking。
+                String thinking = thinkingDelta(delta);
+                if (thinking != null && !thinking.isEmpty()) {
+                    if (!thinkingStarted) {
+                        thinkingStarted = true;
+                        thinkingIdx = content.size();
+                        content.add(new Message.ContentBlock.ThinkingBlock(thinking, null));
+                        partial = new Message.AssistantMessage(
+                                content, partial.api(), partial.provider(), partial.model(),
+                                partial.usage(), partial.stopReason(), null);
+                        stream.emit(new StreamEvent.ThinkingStart(thinkingIdx, partial));
+                    } else {
+                        var block = (Message.ContentBlock.ThinkingBlock) content.get(thinkingIdx);
+                        content.set(thinkingIdx,
+                                new Message.ContentBlock.ThinkingBlock(block.thinking() + thinking,
+                                        block.thinkingSignature()));
+                        partial = new Message.AssistantMessage(
+                                content, partial.api(), partial.provider(), partial.model(),
+                                partial.usage(), partial.stopReason(), null);
+                        stream.emit(new StreamEvent.ThinkingDelta(thinkingIdx, thinking, partial));
+                    }
+                }
+
                 // text content
                 if (delta.has("content") && !delta.get("content").isJsonNull()) {
                     String text = delta.get("content").getAsString();
+                    if (thinkingStarted && !thinkingEnded) {
+                        var block = (Message.ContentBlock.ThinkingBlock) content.get(thinkingIdx);
+                        stream.emit(new StreamEvent.ThinkingEnd(thinkingIdx, block.thinking(), partial));
+                        thinkingEnded = true;
+                    }
                     if (!textStarted) {
                         textStarted = true;
                         textIdx = content.size();
@@ -344,11 +433,40 @@ public class OpenAiCompletionsProvider {
             stream.emit(new StreamEvent.TextEnd(textIdx, block.text(), partial));
         }
 
+        // 只有思考后没有正文时，也要闭合思考块，保证前端收到完整组件生命周期。
+        if (thinkingStarted && !thinkingEnded) {
+            var block = (Message.ContentBlock.ThinkingBlock) content.get(thinkingIdx);
+            stream.emit(new StreamEvent.ThinkingEnd(thinkingIdx, block.thinking(), partial));
+        }
+
         // done
         partial = new Message.AssistantMessage(
                 content, partial.api(), partial.provider(), partial.model(),
                 partial.usage(), partial.stopReason(), null);
         stream.emit(new StreamEvent.Done(partial.stopReason(), partial));
+    }
+
+    private String thinkingDelta(JsonObject delta) {
+        JsonElement element = delta.get(PARAM_REASONING_CONTENT);
+        if (element == null || element.isJsonNull()) element = delta.get(PARAM_THINKING);
+        return textValue(element);
+    }
+
+    private String textValue(JsonElement element) {
+        if (element == null || element.isJsonNull()) return "";
+        if (element.isJsonPrimitive()) return element.getAsString();
+        if (element.isJsonObject()) {
+            JsonObject object = element.getAsJsonObject();
+            JsonElement value = object.get(PARAM_CONTENT);
+            if (value == null || value.isJsonNull()) value = object.get(PARAM_TEXT);
+            return textValue(value);
+        }
+        if (element.isJsonArray()) {
+            StringBuilder result = new StringBuilder();
+            for (JsonElement item : element.getAsJsonArray()) result.append(textValue(item));
+            return result.toString();
+        }
+        return "";
     }
 
     private void finishToolCall(List<Message.ContentBlock> content, int idx,

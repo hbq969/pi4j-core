@@ -12,7 +12,16 @@ public record Model(
         boolean reasoning,
         int contextWindow,
         int maxTokens,
-        Cost cost) {
+        Cost cost,
+        String params) {
+
+    /**
+     * 兼容未配置请求参数的旧构造方式。
+     */
+    public Model(String id, String name, Api api, String provider, String baseUrl,
+                 boolean reasoning, int contextWindow, int maxTokens, Cost cost) {
+        this(id, name, api, provider, baseUrl, reasoning, contextWindow, maxTokens, cost, null);
+    }
 
     /**
      * 费用（每百万 token 的美元价格）。

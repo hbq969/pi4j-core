@@ -26,6 +26,7 @@ import java.io.InputStreamReader;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -36,6 +37,16 @@ public class GoogleProvider {
 
     private static final MediaType JSON = MediaType.get("application/json; charset=utf-8");
     private static final Gson gson = new Gson();
+    private static final String PARAM_REQUEST_TIMEOUT = "request_timeout";
+    private static final String PARAM_GENERATION_CONFIG = "generationConfig";
+    private static final String PARAM_THINKING = "thinking";
+    private static final String PARAM_THINKING_CONFIG = "thinkingConfig";
+    private static final String PARAM_INCLUDE_THOUGHTS = "includeThoughts";
+    private static final String PARAM_TYPE = "type";
+    private static final String THINKING_ENABLED = "enabled";
+    private static final Set<String> RESERVED_GENERATION_PARAMS = Set.of(
+            PARAM_REQUEST_TIMEOUT, "model", "contents", "systemInstruction", "tools",
+            "max_tokens", "maxOutputTokens", PARAM_THINKING);
 
     private final PiCoreConfig config;
     private final OkHttpClient client;
@@ -106,7 +117,7 @@ public class GoogleProvider {
                 .post(RequestBody.create(gson.toJson(body), JSON))
                 .build();
 
-        Response response = client.newCall(request).execute();
+        Response response = clientFor(model).newCall(request).execute();
         if (!response.isSuccessful()) {
             String errBody = "";
             try { if (response.body() != null) errBody = response.body().string(); } catch (Exception ignored) {}
@@ -141,6 +152,7 @@ public class GoogleProvider {
         if (model.maxTokens() > 0) {
             genConfig.addProperty("maxOutputTokens", model.maxTokens());
         }
+        addConfiguredGenerationParams(genConfig, model.params());
         body.add("generationConfig", genConfig);
 
         // tools
@@ -161,6 +173,63 @@ public class GoogleProvider {
         }
 
         return body;
+    }
+
+    /** 将 Google 的 thinkingConfig 放入 generationConfig，并兼容通用 thinking.enabled 配置。 */
+    private void addConfiguredGenerationParams(JsonObject generationConfig, String params) {
+        if (params == null || params.isBlank()) return;
+        try {
+            JsonObject configured = gson.fromJson(params, JsonObject.class);
+            if (configured == null) return;
+
+            JsonObject nested = configured.has(PARAM_GENERATION_CONFIG)
+                    && configured.get(PARAM_GENERATION_CONFIG).isJsonObject()
+                    ? configured.getAsJsonObject(PARAM_GENERATION_CONFIG) : null;
+            if (nested != null) {
+                nested.entrySet().stream()
+                        .filter(e -> !PARAM_REQUEST_TIMEOUT.equals(e.getKey()))
+                        .forEach(e -> generationConfig.add(e.getKey(), e.getValue()));
+            }
+            configured.entrySet().stream()
+                    .filter(e -> !RESERVED_GENERATION_PARAMS.contains(e.getKey())
+                            && !PARAM_GENERATION_CONFIG.equals(e.getKey()))
+                    .forEach(e -> generationConfig.add(e.getKey(), e.getValue()));
+
+            if (configured.has(PARAM_THINKING) && configured.get(PARAM_THINKING).isJsonObject()) {
+                JsonObject thinking = configured.getAsJsonObject(PARAM_THINKING);
+                if (THINKING_ENABLED.equalsIgnoreCase(thinking.has(PARAM_TYPE)
+                        ? thinking.get(PARAM_TYPE).getAsString() : "")) {
+                    JsonObject thinkingConfig = generationConfig.has(PARAM_THINKING_CONFIG)
+                            && generationConfig.get(PARAM_THINKING_CONFIG).isJsonObject()
+                            ? generationConfig.getAsJsonObject(PARAM_THINKING_CONFIG) : new JsonObject();
+                    thinkingConfig.addProperty(PARAM_INCLUDE_THOUGHTS, true);
+                    generationConfig.add(PARAM_THINKING_CONFIG, thinkingConfig);
+                }
+            }
+        } catch (Exception ignored) {
+            // 非法参数不阻断请求，沿用 Provider 默认 generationConfig。
+        }
+    }
+
+    private OkHttpClient clientFor(Model model) {
+        int timeout = requestTimeout(model.params());
+        if (timeout <= 0 || timeout == config.getReadTimeoutSeconds()) return client;
+        return new OkHttpClient.Builder()
+                .connectTimeout(config.getConnectTimeoutSeconds(), TimeUnit.SECONDS)
+                .readTimeout(timeout, TimeUnit.SECONDS)
+                .writeTimeout(config.getWriteTimeoutSeconds(), TimeUnit.SECONDS)
+                .build();
+    }
+
+    private int requestTimeout(String params) {
+        if (params == null || params.isBlank()) return 0;
+        try {
+            JsonObject configured = gson.fromJson(params, JsonObject.class);
+            JsonElement timeout = configured != null ? configured.get(PARAM_REQUEST_TIMEOUT) : null;
+            return timeout != null && !timeout.isJsonNull() ? timeout.getAsInt() : 0;
+        } catch (Exception ignored) {
+            return 0;
+        }
     }
 
     private JsonObject convertMessage(Message msg) {
@@ -211,6 +280,9 @@ public class GoogleProvider {
                              PiEventStream<StreamEvent, Message.AssistantMessage> stream) throws IOException {
 
         var content = new ArrayList<>(partial.content());
+        int thinkingIdx = -1;
+        boolean thinkingStarted = false;
+        boolean thinkingEnded = false;
 
         try (var reader = new BufferedReader(new InputStreamReader(bodyStream.byteStream()))) {
             String line;
@@ -251,6 +323,29 @@ public class GoogleProvider {
 
                     if (part.has("text")) {
                         String text = part.get("text").getAsString();
+                        boolean thought = part.has("thought") && !part.get("thought").isJsonNull()
+                                && part.get("thought").getAsBoolean();
+                        if (thought) {
+                            if (!thinkingStarted) {
+                                thinkingStarted = true;
+                                thinkingIdx = content.size();
+                                content.add(new Message.ContentBlock.ThinkingBlock(text, null));
+                                partial = newMsg(content, partial);
+                                stream.emit(new StreamEvent.ThinkingStart(thinkingIdx, partial));
+                            } else {
+                                var old = (Message.ContentBlock.ThinkingBlock) content.get(thinkingIdx);
+                                content.set(thinkingIdx, new Message.ContentBlock.ThinkingBlock(
+                                        old.thinking() + text, old.thinkingSignature()));
+                                partial = newMsg(content, partial);
+                                stream.emit(new StreamEvent.ThinkingDelta(thinkingIdx, text, partial));
+                            }
+                            continue;
+                        }
+                        if (thinkingStarted && !thinkingEnded) {
+                            var thinking = (Message.ContentBlock.ThinkingBlock) content.get(thinkingIdx);
+                            stream.emit(new StreamEvent.ThinkingEnd(thinkingIdx, thinking.thinking(), partial));
+                            thinkingEnded = true;
+                        }
                         // Gemini 可能在一个 chunk 里返回完整文本，而非增量
                         int textIdx = findOrCreateTextBlock(content);
                         var old = (Message.ContentBlock.TextBlock) content.get(textIdx);
@@ -259,6 +354,11 @@ public class GoogleProvider {
                         stream.emit(new StreamEvent.TextDelta(textIdx, text, partial));
 
                     } else if (part.has("functionCall")) {
+                        if (thinkingStarted && !thinkingEnded) {
+                            var thinking = (Message.ContentBlock.ThinkingBlock) content.get(thinkingIdx);
+                            stream.emit(new StreamEvent.ThinkingEnd(thinkingIdx, thinking.thinking(), partial));
+                            thinkingEnded = true;
+                        }
                         JsonObject fc = part.getAsJsonObject("functionCall");
                         String name = fc.get("name").getAsString();
                         JsonObject args = fc.has("args") && fc.get("args").isJsonObject()
@@ -282,6 +382,11 @@ public class GoogleProvider {
             if (content.get(i) instanceof Message.ContentBlock.TextBlock t) {
                 stream.emit(new StreamEvent.TextEnd(i, t.text(), partial));
             }
+        }
+
+        if (thinkingStarted && !thinkingEnded) {
+            var thinking = (Message.ContentBlock.ThinkingBlock) content.get(thinkingIdx);
+            stream.emit(new StreamEvent.ThinkingEnd(thinkingIdx, thinking.thinking(), partial));
         }
 
         partial = new Message.AssistantMessage(content, partial.api(), partial.provider(),
