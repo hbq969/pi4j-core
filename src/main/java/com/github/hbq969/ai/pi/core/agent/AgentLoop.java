@@ -181,7 +181,8 @@ public class AgentLoop {
                     toolResults = failTruncatedToolCalls(toolCalls, stream);
                     hasToolCalls = false;
                 } else if (!toolCalls.isEmpty()) {
-                    toolResults = executeToolCalls(toolCalls, ctx, stream, stream.cancellationToken());
+                    toolResults = executeToolCalls(toolCalls, ctx, stream,
+                            stream.cancellationToken(), loopCfg);
                     hasToolCalls = true;
                 } else {
                     toolResults = List.of();
@@ -270,7 +271,8 @@ public class AgentLoop {
             List<Message.ContentBlock.ToolCallBlock> toolCalls,
             AgentContext ctx,
             PiEventStream<AgentEvent, List<Message>> stream,
-            CancellationToken cancellationToken) {
+            CancellationToken cancellationToken,
+            AgentLoopConfig loopCfg) {
 
         List<Message.ToolResultMessage> results = new ArrayList<>();
         for (var tc : toolCalls) {
@@ -281,7 +283,7 @@ public class AgentLoop {
                 if (tool == null) {
                     throw new RuntimeException("Tool not found: " + tc.name());
                 }
-                ToolResult result = tool.execute(tc.id(), tc.arguments());
+                ToolResult result = loopCfg.executeTool(tool, tc.id(), tc.arguments());
                 stream.emit(new AgentEvent.ToolExecutionEnd(tc.id(), tc.name(), result, false));
 
                 var trm = new Message.ToolResultMessage(tc.id(), tc.name(), result.output(), false);

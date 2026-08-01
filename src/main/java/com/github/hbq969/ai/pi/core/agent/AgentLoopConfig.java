@@ -12,6 +12,17 @@ import java.util.List;
 public interface AgentLoopConfig {
 
     /**
+     * 执行 AgentLoop 选中的工具。
+     *
+     * <p>默认行为直接执行工具；业务层可以覆盖此回调，在不改变 AgentLoop
+     * 工具注册对象的前提下增加策略审查、审计或上下文传播。</p>
+     */
+    default ToolResult executeTool(AgentTool tool, String toolCallId,
+                                   java.util.Map<String, Object> arguments) throws Exception {
+        return tool.execute(toolCallId, arguments);
+    }
+
+    /**
      * 每轮结束后回调，可切换模型或修改上下文。
      * 返回 PrepareResult.NOOP 表示不做变更。
      */
