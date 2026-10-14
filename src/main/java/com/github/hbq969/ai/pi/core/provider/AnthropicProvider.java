@@ -25,6 +25,7 @@ import java.io.IOException;
 import java.io.InputStreamReader;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -47,6 +48,8 @@ public class AnthropicProvider {
     private static final Set<String> RESERVED_REQUEST_PARAMS = Set.of(
             PARAM_REQUEST_TIMEOUT, PARAM_MODEL, PARAM_MAX_TOKENS, PARAM_STREAM,
             PARAM_SYSTEM, PARAM_MESSAGES, PARAM_TOOLS);
+    /** SSE 数据行前缀，部分国产网关返回 {@code data:} 时不带空格 */
+    private static final String SSE_DATA_PREFIX = "data:";
 
     /** Anthropic 要求 tool_call_id 只含 [a-zA-Z0-9_-] */
     private static String sanitizeToolCallId(String id) {
@@ -298,31 +301,54 @@ public class AnthropicProvider {
                              PiEventStream<StreamEvent, Message.AssistantMessage> stream) throws IOException {
 
         var content = new ArrayList<>(partial.content());
-        // 累积 input_json_delta 的 JSON 片段（key=content index），
+        // 累积 input_json_delta 的 JSON 片段（key=content 下标），
         // 因为 Anthropic SSE 中 tool_use 的 input 是增量流式传入的，不会自动合并到 ToolCallBlock
         var toolInputAccum = new HashMap<Integer, StringBuilder>();
+        // 事件里的 index 是 Anthropic 的块下标；网关漏发 content_block_start（未知块类型）时
+        // 直接用 content.size() 定位会整体错位，因此维护 事件 index → content 下标 的映射
+        Map<Integer, Integer> contentIndexByEventIndex = new HashMap<>();
+        Set<Integer> stoppedBlocks = new HashSet<>();
+        int lastContentIndex = -1;
+        int dataLineCount = 0;
+        String firstNonDataLine = null;
+        boolean stopped = false;
 
         try (var reader = new BufferedReader(new InputStreamReader(bodyStream.byteStream()))) {
             String line;
             while ((line = reader.readLine()) != null) {
                 if (line.isEmpty()) continue;
-                if (!line.startsWith("data: ")) continue;
-                String data = line.substring(6);
+                if (!line.startsWith(SSE_DATA_PREFIX)) {
+                    if (firstNonDataLine == null) firstNonDataLine = line;
+                    continue;
+                }
+                dataLineCount++;
+                String data = line.substring(SSE_DATA_PREFIX.length()).trim();
+                if (data.isEmpty()) continue;
 
-                JsonObject event = gson.fromJson(data, JsonObject.class);
+                JsonObject event;
+                try {
+                    event = gson.fromJson(data, JsonObject.class);
+                } catch (Exception e) {
+                    // 心跳、注释等非 JSON 行
+                    continue;
+                }
+                if (event == null || !event.has("type") || event.get("type").isJsonNull()) continue;
                 String type = event.get("type").getAsString();
 
                 switch (type) {
                     case "message_start" -> {
                         JsonObject msgObj = event.getAsJsonObject("message");
-                        if (msgObj.has("usage")) {
+                        if (msgObj != null && msgObj.has("usage") && msgObj.get("usage").isJsonObject()) {
                             mergeUsage(msgObj.getAsJsonObject("usage"), partial.usage());
                         }
                     }
                     case "content_block_start" -> {
                         JsonObject block = event.getAsJsonObject("content_block");
+                        if (block == null || !block.has("type")) continue;
                         String blockType = block.get("type").getAsString();
                         int idx = content.size();
+                        contentIndexByEventIndex.put(eventIndex(event, idx), idx);
+                        lastContentIndex = idx;
 
                         switch (blockType) {
                             case "text" -> {
@@ -340,94 +366,186 @@ public class AnthropicProvider {
                                 Map<String, Object> inputMap = block.has("input") && block.get("input").isJsonObject()
                                         ? gson.fromJson(block.get("input"), Map.class) : new HashMap<>();
                                 content.add(new Message.ContentBlock.ToolCallBlock(
-                                        block.get("id").getAsString(),
-                                        block.get("name").getAsString(),
+                                        block.has("id") ? block.get("id").getAsString() : "",
+                                        block.has("name") ? block.get("name").getAsString() : "",
                                         inputMap));
                                 partial = newMsg(content, partial);
                                 stream.emit(new StreamEvent.ToolCallStart(idx, partial));
+                            }
+                            default -> {
+                                // 未知块类型（如 redacted_thinking）：占位保持下标一致
+                                content.add(new Message.ContentBlock.TextBlock(""));
+                                partial = newMsg(content, partial);
                             }
                         }
                     }
                     case "content_block_delta" -> {
                         JsonObject delta = event.getAsJsonObject("delta");
+                        if (delta == null || !delta.has("type")) continue;
                         String deltaType = delta.get("type").getAsString();
-                        int idx = event.get("index").getAsInt();
+                        int idx = resolveContentIndex(event, contentIndexByEventIndex, lastContentIndex);
+                        if (idx < 0 || idx >= content.size()) continue;
 
                         switch (deltaType) {
                             case "text_delta" -> {
-                                String text = delta.get("text").getAsString();
-                                var old = (Message.ContentBlock.TextBlock) content.get(idx);
-                                content.set(idx, new Message.ContentBlock.TextBlock(old.text() + text, old.textSignature()));
+                                String text = delta.has("text") ? delta.get("text").getAsString() : "";
+                                // 块类型与增量不匹配时（网关下标错乱）退化为新建块，不抛 ClassCastException
+                                var old = content.get(idx) instanceof Message.ContentBlock.TextBlock t
+                                        ? t : new Message.ContentBlock.TextBlock("");
+                                content.set(idx, new Message.ContentBlock.TextBlock(old.text() + text,
+                                        old.textSignature()));
                                 partial = newMsg(content, partial);
                                 stream.emit(new StreamEvent.TextDelta(idx, text, partial));
                             }
                             case "thinking_delta" -> {
-                                String thinking = delta.get("thinking").getAsString();
-                                var old = (Message.ContentBlock.ThinkingBlock) content.get(idx);
+                                String thinking = delta.has("thinking") ? delta.get("thinking").getAsString() : "";
+                                var old = content.get(idx) instanceof Message.ContentBlock.ThinkingBlock t
+                                        ? t : new Message.ContentBlock.ThinkingBlock("", null);
                                 content.set(idx, new Message.ContentBlock.ThinkingBlock(
                                         old.thinking() + thinking, old.thinkingSignature()));
                                 partial = newMsg(content, partial);
                                 stream.emit(new StreamEvent.ThinkingDelta(idx, thinking, partial));
                             }
                             case "signature_delta" -> {
-                                String sig = delta.get("signature").getAsString();
-                                var old = (Message.ContentBlock.ThinkingBlock) content.get(idx);
-                                String oldSig = old.thinkingSignature() != null ? old.thinkingSignature() : "";
-                                content.set(idx, new Message.ContentBlock.ThinkingBlock(
-                                        old.thinking(), oldSig + sig));
+                                String sig = delta.has("signature") ? delta.get("signature").getAsString() : "";
+                                if (content.get(idx) instanceof Message.ContentBlock.ThinkingBlock old) {
+                                    String oldSig = old.thinkingSignature() != null ? old.thinkingSignature() : "";
+                                    content.set(idx, new Message.ContentBlock.ThinkingBlock(
+                                            old.thinking(), oldSig + sig));
+                                }
                             }
                             case "input_json_delta" -> {
-                                String json = delta.get("partial_json").getAsString();
+                                String json = delta.has("partial_json") ? delta.get("partial_json").getAsString() : "";
                                 // 累积 JSON 片段，content_block_stop 时合并到 ToolCallBlock
                                 toolInputAccum.computeIfAbsent(idx, k -> new StringBuilder()).append(json);
                                 stream.emit(new StreamEvent.ToolCallDelta(idx, json, partial));
                             }
+                            default -> {
+                            }
                         }
                     }
                     case "content_block_stop" -> {
-                        int idx = event.get("index").getAsInt();
-                        var block = content.get(idx);
-
-                        if (block instanceof Message.ContentBlock.TextBlock t) {
-                            stream.emit(new StreamEvent.TextEnd(idx, t.text(), partial));
-                        } else if (block instanceof Message.ContentBlock.ThinkingBlock th) {
-                            stream.emit(new StreamEvent.ThinkingEnd(idx, th.thinking(), partial));
-                        } else if (block instanceof Message.ContentBlock.ToolCallBlock tc) {
-                            // 合并 input_json_delta 累积的 JSON 到 ToolCallBlock
-                            StringBuilder accum = toolInputAccum.get(idx);
-                            if (accum != null && accum.length() > 0) {
-                                try {
-                                    @SuppressWarnings("unchecked")
-                                    Map<String, Object> args = gson.fromJson(accum.toString(), Map.class);
-                                    tc = new Message.ContentBlock.ToolCallBlock(tc.id(), tc.name(), args);
-                                    content.set(idx, tc);
-                                    partial = newMsg(content, partial);
-                                } catch (Exception ignored) {
-                                    // JSON 解析失败，保留空 arguments
-                                }
-                            }
-                            stream.emit(new StreamEvent.ToolCallEnd(idx, tc, partial));
-                        }
+                        int idx = resolveContentIndex(event, contentIndexByEventIndex, lastContentIndex);
+                        if (idx < 0 || idx >= content.size()) continue;
+                        stoppedBlocks.add(idx);
+                        partial = finishBlock(idx, content, toolInputAccum, partial, stream);
                     }
                     case "message_delta" -> {
-                        JsonObject delta = event.getAsJsonObject("delta");
-                        if (delta.has("stop_reason")) {
+                        JsonObject delta = event.has("delta") ? event.getAsJsonObject("delta") : null;
+                        if (delta != null && delta.has("stop_reason") && !delta.get("stop_reason").isJsonNull()) {
                             partial = new Message.AssistantMessage(content, partial.api(), partial.provider(),
                                     partial.model(), partial.usage(),
                                     mapStopReason(delta.get("stop_reason").getAsString()), null);
                         }
-                        if (event.has("usage")) {
+                        if (event.has("usage") && event.get("usage").isJsonObject()) {
                             mergeUsage(event.getAsJsonObject("usage"), partial.usage());
                         }
                     }
                     case "message_stop" -> {
                         partial = new Message.AssistantMessage(content, partial.api(), partial.provider(),
                                 partial.model(), partial.usage(), partial.stopReason(), null);
+                        stopped = true;
                         stream.emit(new StreamEvent.Done(partial.stopReason(), partial));
+                    }
+                    case "error" -> {
+                        // HTTP 200 的 SSE 里携带错误对象（如 overloaded_error），必须显式抛出，
+                        // 否则表现为"模型没有回复/没有工具调用"，调用方会一直等结果
+                        String message = streamErrorMessage(event);
+                        stream.emit(new StreamEvent.Error(message, errorSnapshot(content, partial, message)));
+                        return;
+                    }
+                    default -> {
+                        // ping 等事件忽略
                     }
                 }
             }
         }
+
+        // 完全没有 SSE 数据行：说明对方返回的不是流式响应（部分网关用 HTTP 200 + JSON 错误体），
+        // 不能静默当成空回答，必须把原文抛出来
+        if (dataLineCount == 0 && firstNonDataLine != null) {
+            String nonSse = StrUtil.sub(firstNonDataLine, 0, 300);
+            stream.emit(new StreamEvent.Error(nonSse, errorSnapshot(content, partial, nonSse)));
+            return;
+        }
+
+        // 流结束但没收到 message_stop（部分网关直接断流）：补齐未闭合的块并发出 Done，
+        // 否则调用方会一直阻塞在结果上（表现为页面一直转圈）
+        if (!stopped) {
+            for (int i = 0; i < content.size(); i++) {
+                if (!stoppedBlocks.contains(i)) {
+                    partial = finishBlock(i, content, toolInputAccum, partial, stream);
+                }
+            }
+            partial = newMsg(content, partial);
+            stream.emit(new StreamEvent.Done(partial.stopReason(), partial));
+        }
+    }
+
+    /** 事件里的块下标；缺失时用 {@code fallback}。 */
+    private int eventIndex(JsonObject event, int fallback) {
+        JsonElement index = event.get("index");
+        return index != null && !index.isJsonNull() ? index.getAsInt() : fallback;
+    }
+
+    /** 事件下标 → content 下标；网关漏发 content_block_start 时退化为最后一个已建立的块。 */
+    private int resolveContentIndex(JsonObject event, Map<Integer, Integer> mapping, int fallback) {
+        Integer mapped = mapping.get(eventIndex(event, Integer.MIN_VALUE));
+        return mapped != null ? mapped : fallback;
+    }
+
+    /** 闭合一个内容块：合并工具参数增量并发出对应的 End 事件。 */
+    private Message.AssistantMessage finishBlock(int idx, List<Message.ContentBlock> content,
+                                                 Map<Integer, StringBuilder> toolInputAccum,
+                                                 Message.AssistantMessage partial,
+                                                 PiEventStream<StreamEvent, Message.AssistantMessage> stream) {
+        var block = content.get(idx);
+
+        if (block instanceof Message.ContentBlock.TextBlock t) {
+            stream.emit(new StreamEvent.TextEnd(idx, t.text(), partial));
+        } else if (block instanceof Message.ContentBlock.ThinkingBlock th) {
+            stream.emit(new StreamEvent.ThinkingEnd(idx, th.thinking(), partial));
+        } else if (block instanceof Message.ContentBlock.ToolCallBlock tc) {
+            // 合并 input_json_delta 累积的 JSON 到 ToolCallBlock
+            Message.ContentBlock.ToolCallBlock finished = tc;
+            StringBuilder accum = toolInputAccum.get(idx);
+            if (accum != null && accum.length() > 0) {
+                try {
+                    @SuppressWarnings("unchecked")
+                    Map<String, Object> args = gson.fromJson(accum.toString(), Map.class);
+                    finished = new Message.ContentBlock.ToolCallBlock(tc.id(), tc.name(),
+                            args != null ? args : new HashMap<>());
+                    content.set(idx, finished);
+                    partial = newMsg(content, partial);
+                } catch (Exception ignored) {
+                    // JSON 解析失败，保留 content_block_start 里的初始参数
+                }
+            }
+            stream.emit(new StreamEvent.ToolCallEnd(idx, finished, partial));
+        }
+        return partial;
+    }
+
+    /** Anthropic 的 error 事件：{@code {"type":"error","error":{"type":"overloaded_error","message":"..."}}}。 */
+    private String streamErrorMessage(JsonObject event) {
+        JsonElement error = event.get("error");
+        if (error != null && !error.isJsonNull()) {
+            if (error.isJsonObject()) {
+                JsonObject obj = error.getAsJsonObject();
+                if (obj.has("message") && !obj.get("message").isJsonNull()) {
+                    return obj.get("message").getAsString();
+                }
+                return obj.toString();
+            }
+            return error.getAsString();
+        }
+        return "Unknown stream error: " + event;
+    }
+
+    private Message.AssistantMessage errorSnapshot(List<Message.ContentBlock> content,
+                                                   Message.AssistantMessage base, String message) {
+        return new Message.AssistantMessage(content, base.api(), base.provider(), base.model(),
+                base.usage(), StopReason.ERROR, StrUtil.sub(message, 0, 500));
     }
 
     private Message.AssistantMessage newMsg(List<Message.ContentBlock> content, Message.AssistantMessage partial) {
