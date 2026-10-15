@@ -9,6 +9,7 @@ import com.github.hbq969.ai.pi.core.api.Usage;
 import com.github.hbq969.ai.pi.core.config.PiCoreConfig;
 import com.github.hbq969.ai.pi.core.stream.PiEventStream;
 import com.github.hbq969.ai.pi.core.stream.StreamEvent;
+import com.github.hbq969.ai.pi.core.util.Exceptions;
 import com.github.hbq969.ai.pi.core.util.RetryPolicy;
 import com.google.gson.Gson;
 import com.google.gson.JsonArray;
@@ -177,7 +178,7 @@ public class OpenAiCompletionsProvider {
             partial = new Message.AssistantMessage(
                     partial.content(), partial.api(), partial.provider(), partial.model(),
                     partial.usage(), StopReason.ERROR,
-                    StrUtil.sub(e.getMessage(), 0, 500));
+                    StrUtil.sub(Exceptions.describe(e), 0, 500));
             stream.emit(new StreamEvent.Error(partial.error(), partial));
         }
     }
